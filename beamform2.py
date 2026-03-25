@@ -476,10 +476,16 @@ def processor_thread(input_q, output_q, beamformer, agc):
             prev_chunk = chunk.copy()
             continue
 
-        output = beamformer.process(prev_chunk, chunk, AZIMUTH, ELEVATION)
-        output = agc.apply(output)
-        output = np.clip(output, -1.0, 1.0)
-        out_int16 = (output * 32767).astype(np.int16)
+        try:
+            output = beamformer.process(prev_chunk, chunk, AZIMUTH, ELEVATION)
+            output = agc.apply(output)
+            output = np.clip(output, -1.0, 1.0)
+            out_int16 = (output * 32767).astype(np.int16)
+        except Exception as e:
+            print(f"\n[PROC] Error: {e}")
+            stats['errors'] += 1
+            # Fallback: average all channels
+            out_int16 = (np.mean(chunk, axis=1) * 32767).astype(np.int16)
 
         if output_q.full():
             try:
