@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Real-time Frequency-Domain Audio Beamforming for Sipeed 6+1 Mic Array
-STFT-based MVDR/GEV beamforming with 7 real microphone channels
-via Tang Nano 9K FPGA — full circular array configuration
+Real-time Audio Beamforming for Sipeed 6+1 Mic Array
+via Tang Nano 9K FPGA — optimized for Raspberry Pi 4B
 
 Channel mapping (from FPGA i2s_receiver):
   ch0 = D0 left  → mic 0 (outer, 0°)
@@ -17,10 +16,9 @@ Channel mapping (from FPGA i2s_receiver):
 import struct
 import numpy as np
 import pyaudio
-from scipy.linalg import eigh
-from scipy.signal import stft, istft
 from collections import deque
 import threading
+import queue
 import time
 import sys
 import platform
@@ -28,13 +26,12 @@ import os
 import subprocess
 
 # ============================================================================
-# SERIAL CONFIGURATION  (Tang Nano 9K via BL702 USB-UART)
+# SERIAL CONFIGURATION
 # ============================================================================
 
 SERIAL_BAUD = 3_000_000
 
 def find_serial_port():
-    """Auto-detect Tang Nano 9K COM port"""
     if platform.system() == 'Windows':
         import serial.tools.list_ports
         ports = serial.tools.list_ports.comports()
@@ -54,13 +51,7 @@ def find_serial_port():
 
 
 class RawSerialPort:
-    """Raw serial reader that bypasses pyserial on Linux.
-
-    The BL702 chip on the Tang Nano 9K crashes when pyserial sends
-    DTR/RTS modem control signals during open().  This class uses
-    stty + os.open(O_NOCTTY) to avoid that entirely.
-    On Windows, falls back to pyserial which works fine.
-    """
+    """Raw serial reader bypassing pyserial on Linux (BL702 workaround)."""
 
     def __init__(self, port, baudrate, timeout=1):
         self.port = port
@@ -68,7 +59,6 @@ class RawSerialPort:
         self.timeout = timeout
         self._fd = None
         self._ser = None
-        self._buf = b''
 
         if platform.system() == 'Windows':
             import serial
@@ -77,14 +67,12 @@ class RawSerialPort:
             self._init_linux()
 
     def _init_linux(self):
-        latency_path = None
         dev_name = os.path.basename(self.port)
         lt = f'/sys/bus/usb-serial/devices/{dev_name}/latency_timer'
         if os.path.exists(lt):
             try:
                 subprocess.run(['sudo', 'tee', lt],
                                input=b'1', capture_output=True, timeout=5)
-                latency_path = lt
             except Exception:
                 pass
 
@@ -94,7 +82,6 @@ class RawSerialPort:
         ], check=True, timeout=5)
 
         self._fd = os.open(self.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
-
         import select
         self._poll = select.poll()
         self._poll.register(self._fd, select.POLLIN)
@@ -119,6 +106,19 @@ class RawSerialPort:
                 except BlockingIOError:
                     pass
         return bytes(data)
+
+    def read_available(self, max_size=65536):
+        """Non-blocking read of whatever is available."""
+        if self._ser is not None:
+            waiting = self._ser.in_waiting
+            if waiting > 0:
+                return self._ser.read(min(waiting, max_size))
+            return b''
+
+        try:
+            return os.read(self._fd, max_size)
+        except BlockingIOError:
+            return b''
 
     def reset_input_buffer(self):
         if self._ser is not None:
@@ -151,467 +151,249 @@ SERIAL_PORT = find_serial_port()
 # AUDIO / FPGA PARAMETERS
 # ============================================================================
 
-# Tang Nano 9K: BCLK = 27 MHz / (2*13) = 1038461 Hz, WS = BCLK / 64
-SAMPLE_RATE = 16226       # actual Fs from FPGA (27e6 / 26 / 64)
-CHANNELS = 7              # all 7 real mics from FPGA
-CHUNK_SIZE = 512           # frames per packet (matches FPGA packetizer)
+SAMPLE_RATE = 16226
+CHANNELS = 7
+CHUNK_SIZE = 512
 BITS_PER_SAMPLE = 16
-
-# STFT parameters — must fit within CHUNK_SIZE (512 samples per packet)
-NFFT = 512
-OVERLAP = NFFT * 3 // 4   # 75% overlap for better time resolution
-HOP_LENGTH = NFFT - OVERLAP
+SPEED_OF_SOUND = 343.0
 
 # ============================================================================
-# SIPEED 6+1 CIRCULAR MICROPHONE ARRAY GEOMETRY
+# MICROPHONE ARRAY GEOMETRY
 # ============================================================================
 
-# The Sipeed array has 6 outer mics in a circle + 1 center mic.
-# Outer mic radius ≈ 35 mm from center — MEASURE YOUR ARRAY and adjust.
-ARRAY_RADIUS = 0.035  # meters
+ARRAY_RADIUS = 0.035
 
-# 6 outer mics at 60° intervals (counter-clockwise from +X axis)
-# Center mic at origin
 MIC_POSITIONS = np.array([
-    [ARRAY_RADIUS * np.cos(np.radians(  0)), ARRAY_RADIUS * np.sin(np.radians(  0)), 0.0],  # ch0: mic 0 @ 0°
-    [ARRAY_RADIUS * np.cos(np.radians( 60)), ARRAY_RADIUS * np.sin(np.radians( 60)), 0.0],  # ch1: mic 1 @ 60°
-    [ARRAY_RADIUS * np.cos(np.radians(120)), ARRAY_RADIUS * np.sin(np.radians(120)), 0.0],  # ch2: mic 2 @ 120°
-    [ARRAY_RADIUS * np.cos(np.radians(180)), ARRAY_RADIUS * np.sin(np.radians(180)), 0.0],  # ch3: mic 3 @ 180°
-    [ARRAY_RADIUS * np.cos(np.radians(240)), ARRAY_RADIUS * np.sin(np.radians(240)), 0.0],  # ch4: mic 4 @ 240°
-    [ARRAY_RADIUS * np.cos(np.radians(300)), ARRAY_RADIUS * np.sin(np.radians(300)), 0.0],  # ch5: mic 5 @ 300°
-    [0.0, 0.0, 0.0],                                                                          # ch6: center mic
+    [ARRAY_RADIUS * np.cos(np.radians(  0)), ARRAY_RADIUS * np.sin(np.radians(  0)), 0.0],
+    [ARRAY_RADIUS * np.cos(np.radians( 60)), ARRAY_RADIUS * np.sin(np.radians( 60)), 0.0],
+    [ARRAY_RADIUS * np.cos(np.radians(120)), ARRAY_RADIUS * np.sin(np.radians(120)), 0.0],
+    [ARRAY_RADIUS * np.cos(np.radians(180)), ARRAY_RADIUS * np.sin(np.radians(180)), 0.0],
+    [ARRAY_RADIUS * np.cos(np.radians(240)), ARRAY_RADIUS * np.sin(np.radians(240)), 0.0],
+    [ARRAY_RADIUS * np.cos(np.radians(300)), ARRAY_RADIUS * np.sin(np.radians(300)), 0.0],
+    [0.0, 0.0, 0.0],
 ])
 
 # ============================================================================
 # BEAMFORMING PARAMETERS
 # ============================================================================
 
-BEAMFORMER_TYPE = 'MVDR'   # 'MVDR' or 'GEV' or 'DelaySum'
-SPEED_OF_SOUND = 343.0     # m/s
-NOISE_UPDATE_RATE = 0.15   # seconds between noise covariance updates
-REGULARIZATION = 1e-4      # diagonal loading (lower = more aggressive nulling)
+BEAMFORMER_TYPE = 'DelaySum'   # 'DelaySum' (fast/clear) or 'MVDR' (heavy but sharper)
+AZIMUTH_FRONT = 0.0
+ELEVATION_FRONT = 0.0
 
-# Frequency range for adaptive beamforming (speech band)
-FREQ_MIN = 200    # Hz — circular array resolves lower freqs than 2-mic
-FREQ_MAX = 5000   # Hz — extend upper range for better clarity
+# AGC (Automatic Gain Control) — smooth gain to avoid pumping artifacts
+AGC_TARGET = 0.75
+AGC_ATTACK = 0.02    # fast attack for sudden loud sounds
+AGC_RELEASE = 0.0005  # slow release for smooth gain recovery
 
-# Target direction
-AZIMUTH_FRONT = 0.0    # degrees (0° = +X axis)
-ELEVATION_FRONT = 0.0  # degrees (0° = horizontal)
-
-# Zoom angle range for future audio zoom control
-ZOOM_MIN_ANGLE = 8
-ZOOM_MAX_ANGLE = 60
+# Output buffer: holds chunks for smooth playback (absorbs processing jitter)
+OUTPUT_QUEUE_SIZE = 8
 
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
 
-current_zoom_angle = 60.0
 current_azimuth = AZIMUTH_FRONT
 current_elevation = ELEVATION_FRONT
-audio_output = None
 running = True
-stats = {'packets': 0, 'errors': 0, 'drops': 0, 'last_time': time.time()}
+stats = {'packets': 0, 'errors': 0, 'drops': 0}
 
 # ============================================================================
-# FREQUENCY-DOMAIN BEAMFORMING (optimized for 7-channel circular array)
+# TIME-DOMAIN DELAY-AND-SUM BEAMFORMER (fast, Pi-friendly)
 # ============================================================================
 
-class FrequencyDomainBeamformer:
-    def __init__(self, mic_positions, sample_rate):
+class TimeDomainBeamformer:
+    """Delay-and-sum in frequency domain (one FFT cycle, no STFT overhead).
+
+    For a 35mm circular array at 16kHz, max inter-mic delay is ~1.6 samples.
+    We apply fractional delays via phase shifts in a single FFT/IFFT pair,
+    which is far cheaper than full STFT-based MVDR.
+    """
+
+    def __init__(self, mic_positions, sample_rate, n_samples):
         self.mic_positions = mic_positions
         self.n_mics = len(mic_positions)
         self.sample_rate = sample_rate
-        self.nfft = NFFT
-        self.hop_length = HOP_LENGTH
-
-        self.freqs = np.fft.rfftfreq(self.nfft, 1.0 / sample_rate)
-        self.n_freqs = len(self.freqs)
-
-        self.freq_min_idx = np.argmin(np.abs(self.freqs - FREQ_MIN))
-        self.freq_max_idx = np.argmin(np.abs(self.freqs - FREQ_MAX))
-
-        self.noise_cov = np.zeros((self.n_freqs, self.n_mics, self.n_mics), dtype=complex)
-        for f in range(self.n_freqs):
-            self.noise_cov[f] = np.eye(self.n_mics) * REGULARIZATION
-
-        self.noise_buffer = deque(maxlen=80)
-        self.noise_update_counter = 0
-
-        self.window = np.hanning(self.nfft)
-
-        # Pre-compute steering vectors for the target direction (updated when direction changes)
+        self.n_samples = n_samples
+        self.freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
         self._cached_az = None
         self._cached_el = None
-        self._cached_steering = None
+        self._cached_shifts = None
 
-        print(f"  Mics: {self.n_mics} (6 circular + 1 center)")
-        print(f"  Frequency bins: {self.n_freqs}")
-        print(f"  Beamforming range: {FREQ_MIN}-{FREQ_MAX} Hz "
-              f"(bins {self.freq_min_idx}-{self.freq_max_idx})")
+    def _compute_delay_filters(self, azimuth_deg, elevation_deg):
+        if self._cached_az == azimuth_deg and self._cached_el == elevation_deg:
+            return self._cached_shifts
 
-    def steering_vector(self, azimuth_deg, freq_hz, elevation_deg=0):
-        az_rad = np.radians(azimuth_deg)
-        el_rad = np.radians(elevation_deg)
-
-        doa = np.array([
-            np.cos(el_rad) * np.cos(az_rad),
-            np.cos(el_rad) * np.sin(az_rad),
-            np.sin(el_rad)
-        ])
+        az = np.radians(azimuth_deg)
+        el = np.radians(elevation_deg)
+        doa = np.array([np.cos(el)*np.cos(az), np.cos(el)*np.sin(az), np.sin(el)])
 
         delays = self.mic_positions @ doa / SPEED_OF_SOUND
-        omega = 2.0 * np.pi * freq_hz
-        steering = np.exp(-1j * omega * delays)
-        return steering / np.linalg.norm(steering)
+        delays -= delays.mean()
 
-    def get_all_steering(self, azimuth_deg, elevation_deg=0):
-        """Pre-compute steering vectors for all frequency bins (cached)"""
-        if self._cached_az == azimuth_deg and self._cached_el == elevation_deg and self._cached_steering is not None:
-            return self._cached_steering
-
-        sv = np.zeros((self.n_freqs, self.n_mics), dtype=complex)
-        for f in range(self.n_freqs):
-            sv[f] = self.steering_vector(azimuth_deg, self.freqs[f], elevation_deg)
+        shifts = np.zeros((self.n_mics, len(self.freqs)), dtype=complex)
+        for m in range(self.n_mics):
+            shifts[m] = np.exp(-1j * 2 * np.pi * self.freqs * (-delays[m]))
 
         self._cached_az = azimuth_deg
         self._cached_el = elevation_deg
-        self._cached_steering = sv
-        return sv
+        self._cached_shifts = shifts
+        return shifts
 
-    def update_noise_covariance(self, stft_data):
-        self.noise_buffer.append(stft_data)
+    def process(self, audio_chunk, azimuth_deg, elevation_deg=0):
+        shifts = self._compute_delay_filters(azimuth_deg, elevation_deg)
 
-        if len(self.noise_buffer) >= 15:
-            all_frames = np.concatenate(list(self.noise_buffer), axis=2)
-            for f in range(self.n_freqs):
-                X = all_frames[f, :, :]
-                cov = (X @ X.conj().T) / X.shape[1]
-                cov += np.eye(self.n_mics) * REGULARIZATION
-                self.noise_cov[f] = cov
+        aligned_sum = np.zeros(len(self.freqs), dtype=complex)
+        for m in range(self.n_mics):
+            spectrum = np.fft.rfft(audio_chunk[:, m])
+            aligned_sum += spectrum * shifts[m]
 
-
-class MVDRFrequencyBeamformer(FrequencyDomainBeamformer):
-    """MVDR Beamformer — 7-mic circular array
-
-    With 7 mics the MVDR can place up to 6 spatial nulls on interferers,
-    giving far superior noise rejection compared to the old 2-mic setup.
-    """
-
-    def process_chunk(self, audio_chunk, azimuth_deg, elevation_deg=0):
-        n_samples = audio_chunk.shape[0]
-
-        stft_data = []
-        for mic in range(self.n_mics):
-            _, _, Zxx = stft(audio_chunk[:, mic],
-                             fs=self.sample_rate,
-                             window=self.window,
-                             nperseg=self.nfft,
-                             noverlap=OVERLAP)
-            stft_data.append(Zxx)
-
-        stft_data = np.array(stft_data).transpose(1, 0, 2)
-        n_frames = stft_data.shape[2]
-
-        self.noise_update_counter += 1
-        noise_interval = max(1, int(NOISE_UPDATE_RATE * self.sample_rate / CHUNK_SIZE))
-        if self.noise_update_counter % noise_interval == 0:
-            self.update_noise_covariance(stft_data)
-
-        all_steering = self.get_all_steering(azimuth_deg, elevation_deg)
-        output_stft = np.zeros((self.n_freqs, n_frames), dtype=complex)
-
-        eye_reg = np.eye(self.n_mics) * REGULARIZATION
-
-        for f in range(self.n_freqs):
-            freq_hz = self.freqs[f]
-            a = all_steering[f]
-
-            if freq_hz < FREQ_MIN or freq_hz > FREQ_MAX or freq_hz < 1.0:
-                w = a / self.n_mics
-            else:
-                X = stft_data[f, :, :]
-                R = (X @ X.conj().T) / n_frames + eye_reg
-                try:
-                    R_inv = np.linalg.inv(R)
-                    num = R_inv @ a
-                    den = a.conj() @ num
-                    w = num / (den + 1e-12)
-                except np.linalg.LinAlgError:
-                    w = a / self.n_mics
-
-            output_stft[f, :] = w.conj() @ stft_data[f, :, :]
-
-        _, output_time = istft(output_stft,
-                               fs=self.sample_rate,
-                               window=self.window,
-                               nperseg=self.nfft,
-                               noverlap=OVERLAP)
-
-        output_time = _match_length(output_time, n_samples)
-        return _normalize(output_time)
-
-
-class GEVFrequencyBeamformer(FrequencyDomainBeamformer):
-    """GEV Beamformer — maximizes SNR via generalized eigenvalue decomposition.
-
-    Especially effective with 7 mics: the eigenvector corresponding to the
-    largest eigenvalue captures the dominant source direction with high fidelity.
-    """
-
-    def process_chunk(self, audio_chunk, azimuth_deg, elevation_deg=0):
-        n_samples = audio_chunk.shape[0]
-
-        stft_data = []
-        for mic in range(self.n_mics):
-            _, _, Zxx = stft(audio_chunk[:, mic],
-                             fs=self.sample_rate,
-                             window=self.window,
-                             nperseg=self.nfft,
-                             noverlap=OVERLAP)
-            stft_data.append(Zxx)
-
-        stft_data = np.array(stft_data).transpose(1, 0, 2)
-        n_frames = stft_data.shape[2]
-
-        self.noise_update_counter += 1
-        noise_interval = max(1, int(NOISE_UPDATE_RATE * self.sample_rate / CHUNK_SIZE))
-        if self.noise_update_counter % noise_interval == 0:
-            self.update_noise_covariance(stft_data)
-
-        all_steering = self.get_all_steering(azimuth_deg, elevation_deg)
-        output_stft = np.zeros((self.n_freqs, n_frames), dtype=complex)
-        eye_reg = np.eye(self.n_mics) * REGULARIZATION
-
-        for f in range(self.n_freqs):
-            freq_hz = self.freqs[f]
-            a = all_steering[f]
-
-            if freq_hz < FREQ_MIN or freq_hz > FREQ_MAX or freq_hz < 1.0:
-                w = a / self.n_mics
-            else:
-                X = stft_data[f, :, :]
-                R_signal = (X @ X.conj().T) / n_frames + eye_reg
-                R_noise = self.noise_cov[f]
-
-                try:
-                    eigenvalues, eigenvectors = eigh(R_signal, R_noise)
-                    w = eigenvectors[:, -1]
-                    phase_align = a.conj() @ w
-                    if abs(phase_align) > 1e-10:
-                        w = w * (phase_align / abs(phase_align))
-                except (np.linalg.LinAlgError, ValueError):
-                    w = a / self.n_mics
-
-            output_stft[f, :] = w.conj() @ stft_data[f, :, :]
-
-        _, output_time = istft(output_stft,
-                               fs=self.sample_rate,
-                               window=self.window,
-                               nperseg=self.nfft,
-                               noverlap=OVERLAP)
-
-        output_time = _match_length(output_time, n_samples)
-        return _normalize(output_time)
-
-
-class DelayAndSumFrequencyBeamformer(FrequencyDomainBeamformer):
-    """Delay-and-Sum — simple but robust baseline with 7 mics.
-
-    With the circular array this already gives ~8.5 dB array gain
-    (10*log10(7) = 8.45 dB) compared to ~3 dB from 2 mics.
-    """
-
-    def process_chunk(self, audio_chunk, azimuth_deg, elevation_deg=0):
-        n_samples = audio_chunk.shape[0]
-
-        stft_data = []
-        for mic in range(self.n_mics):
-            _, _, Zxx = stft(audio_chunk[:, mic],
-                             fs=self.sample_rate,
-                             window=self.window,
-                             nperseg=self.nfft,
-                             noverlap=OVERLAP)
-            stft_data.append(Zxx)
-
-        stft_data = np.array(stft_data).transpose(1, 0, 2)
-        n_frames = stft_data.shape[2]
-
-        all_steering = self.get_all_steering(azimuth_deg, elevation_deg)
-        output_stft = np.zeros((self.n_freqs, n_frames), dtype=complex)
-
-        for f in range(self.n_freqs):
-            w = all_steering[f] / self.n_mics
-            output_stft[f, :] = w.conj() @ stft_data[f, :, :]
-
-        _, output_time = istft(output_stft,
-                               fs=self.sample_rate,
-                               window=self.window,
-                               nperseg=self.nfft,
-                               noverlap=OVERLAP)
-
-        output_time = _match_length(output_time, n_samples)
-        return _normalize(output_time)
+        aligned_sum /= self.n_mics
+        return np.fft.irfft(aligned_sum, n=self.n_samples)
 
 
 # ============================================================================
-# HELPERS
+# SIMPLE AGC (smooth, no pumping)
 # ============================================================================
 
-def _match_length(signal, target_len):
-    if len(signal) < target_len:
-        return np.pad(signal, (0, target_len - len(signal)))
-    return signal[:target_len]
+class SmoothAGC:
+    def __init__(self, target=AGC_TARGET, attack=AGC_ATTACK, release=AGC_RELEASE):
+        self.target = target
+        self.attack = attack
+        self.release = release
+        self.gain = 1.0
 
+    def apply(self, signal):
+        peak = np.max(np.abs(signal))
+        if peak < 1e-8:
+            return signal
 
-def _normalize(signal, target=0.85):
-    peak = np.max(np.abs(signal))
-    if peak > 1e-6:
-        signal = signal * target / peak
-    return signal
+        desired_gain = self.target / peak
+
+        if desired_gain < self.gain:
+            self.gain += self.attack * (desired_gain - self.gain)
+        else:
+            self.gain += self.release * (desired_gain - self.gain)
+
+        self.gain = np.clip(self.gain, 0.01, 50.0)
+        return signal * self.gain
 
 
 # ============================================================================
-# SERIAL RECEIVER
+# SERIAL PACKET READER (buffered, efficient)
 # ============================================================================
 
-def read_audio_stream(ser, beamformer):
-    """Read MIC-header packets from Tang Nano 9K and apply beamforming"""
-    global running, stats, audio_output, current_azimuth, current_elevation
+HEADER_MARKER = b'MIC'
+PACKET_DATA_SIZE = CHUNK_SIZE * CHANNELS * 2
+FULL_PACKET_SIZE = 6 + PACKET_DATA_SIZE   # 'MIC' + 2-byte len + 1-byte nch + data
 
-    print("Starting audio receiver...")
+def serial_reader_thread(ser, audio_queue):
+    """Reads serial data in large chunks, extracts MIC packets, pushes audio."""
+    global running, stats
 
-    sync_buf = bytearray()
-
-    def find_mic_header():
-        while running:
-            byte = ser.read(1)
-            if not byte:
-                return False
-            sync_buf.append(byte[0])
-            if len(sync_buf) > 3:
-                sync_buf.pop(0)
-            if len(sync_buf) == 3 and bytes(sync_buf) == b'MIC':
-                sync_buf.clear()
-                return True
-        return False
+    buf = bytearray()
+    CHUNK_READ = 8192
 
     while running:
         try:
-            if not find_mic_header():
+            new_data = ser.read(CHUNK_READ)
+            if not new_data:
+                time.sleep(0.001)
                 continue
 
-            header_rest = ser.read(3)
-            if len(header_rest) != 3:
-                stats['errors'] += 1
-                continue
+            buf.extend(new_data)
 
-            n_samples = struct.unpack('<H', header_rest[:2])[0]
-            n_channels = header_rest[2]
+            while len(buf) >= FULL_PACKET_SIZE:
+                idx = buf.find(HEADER_MARKER)
+                if idx < 0:
+                    buf = buf[-2:]
+                    break
 
-            if n_channels != CHANNELS or n_samples != CHUNK_SIZE or n_samples > 2048:
-                stats['errors'] += 1
-                continue
+                if idx > 0:
+                    buf = buf[idx:]
 
-            data_size = n_samples * n_channels * 2
-            audio_bytes = ser.read(data_size)
+                if len(buf) < 6:
+                    break
 
-            if len(audio_bytes) != data_size:
-                stats['drops'] += 1
-                continue
+                n_samples = struct.unpack('<H', buf[3:5])[0]
+                n_channels = buf[5]
 
-            audio_int = np.frombuffer(audio_bytes, dtype=np.int16)
-            audio_data = audio_int.reshape(n_samples, n_channels).astype(np.float32) / 32768.0
+                if n_channels != CHANNELS or n_samples != CHUNK_SIZE:
+                    stats['errors'] += 1
+                    buf = buf[3:]
+                    continue
 
-            output_audio = beamformer.process_chunk(
-                audio_data, current_azimuth, current_elevation)
+                needed = 6 + n_samples * n_channels * 2
+                if len(buf) < needed:
+                    break
 
-            output_audio = np.clip(output_audio, -1.0, 1.0)
-            output_int16 = (output_audio * 32767).astype(np.int16)
+                audio_bytes = bytes(buf[6:needed])
+                buf = buf[needed:]
 
-            if audio_output:
-                audio_output.write(output_int16.tobytes())
+                audio_int = np.frombuffer(audio_bytes, dtype=np.int16)
+                audio_data = audio_int.reshape(n_samples, n_channels).astype(np.float32) / 32768.0
 
-            stats['packets'] += 1
+                if audio_queue.full():
+                    try:
+                        audio_queue.get_nowait()
+                        stats['drops'] += 1
+                    except queue.Empty:
+                        pass
+
+                audio_queue.put(audio_data)
+                stats['packets'] += 1
 
         except Exception as e:
-            print(f"\nError in audio stream: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"\nSerial read error: {e}")
             stats['errors'] += 1
             time.sleep(0.01)
 
 
 # ============================================================================
-# DIRECTION CONTROL
+# AUDIO PROCESSING + PLAYBACK THREAD
 # ============================================================================
 
-def direction_control_thread():
-    """Update beamforming direction.
+def audio_playback_thread(audio_queue, beamformer, agc, p_audio_stream):
+    """Takes chunks from queue, beamforms, applies AGC, writes to speaker."""
+    global running, current_azimuth, current_elevation
 
-    Currently fixed forward.  With the circular array, you can steer
-    to any azimuth 0-360° by changing current_azimuth, e.g. from a
-    DOA estimator or keyboard input.
-    """
-    global current_azimuth, current_elevation, running
-
-    print("Direction control: fixed front-facing (modify for dynamic steering)")
+    silence = np.zeros(CHUNK_SIZE, dtype=np.int16).tobytes()
 
     while running:
-        time.sleep(0.1)
+        try:
+            audio_data = audio_queue.get(timeout=0.05)
+        except queue.Empty:
+            p_audio_stream.write(silence)
+            continue
+
+        try:
+            output = beamformer.process(audio_data, current_azimuth, current_elevation)
+            output = agc.apply(output)
+            output = np.clip(output, -1.0, 1.0)
+            output_int16 = (output * 32767).astype(np.int16)
+            p_audio_stream.write(output_int16.tobytes())
+        except Exception as e:
+            print(f"\nProcessing error: {e}")
+            p_audio_stream.write(silence)
 
 
 # ============================================================================
-# AUDIO OUTPUT
-# ============================================================================
-
-def setup_audio_output():
-    global audio_output
-
-    p = pyaudio.PyAudio()
-
-    print("\nAvailable audio devices:")
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info['maxOutputChannels'] > 0:
-            print(f"  [{i}] {info['name']} (out: {info['maxOutputChannels']})")
-
-    audio_output = p.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=SAMPLE_RATE,
-        output=True,
-        frames_per_buffer=CHUNK_SIZE
-    )
-
-    print(f"\nAudio output: {SAMPLE_RATE} Hz, mono")
-    return p
-
-
-# ============================================================================
-# STATISTICS
+# STATS
 # ============================================================================
 
 def stats_thread_fn():
-    global running, stats, current_azimuth, current_elevation
-
+    global running, stats
     last_packets = 0
 
     while running:
         time.sleep(2.0)
-        packets = stats['packets']
-        errors = stats['errors']
-        drops = stats['drops']
-        pps = (packets - last_packets) / 2.0
-
-        print(f"\r[STATS] pkts={packets}  rate={pps:.1f}/s  "
-              f"err={errors}  drop={drops}  "
-              f"az={current_azimuth:.0f}  "
-              f"lat~{NFFT/SAMPLE_RATE*1000:.0f}ms",
+        pkts = stats['packets']
+        pps = (pkts - last_packets) / 2.0
+        print(f"\r[STATS] pkts={pkts}  rate={pps:.1f}/s  "
+              f"err={stats['errors']}  drop={stats['drops']}  "
+              f"az={current_azimuth:.0f}°",
               end='', flush=True)
-
-        last_packets = packets
+        last_packets = pkts
 
 
 # ============================================================================
@@ -619,59 +401,63 @@ def stats_thread_fn():
 # ============================================================================
 
 def main():
-    global running, audio_output
+    global running
 
-    print("=" * 70)
-    print(" Audio Beamforming — Sipeed 6+1 Circular Array via Tang Nano 9K")
-    print("=" * 70)
-    print(f"\n  Serial:      {SERIAL_PORT} @ {SERIAL_BAUD/1e6:.0f} Mbaud")
-    print(f"  Sample rate: {SAMPLE_RATE} Hz  (from FPGA clock divider)")
-    print(f"  Channels:    {CHANNELS} (6 circular + 1 center)")
-    print(f"  Array radius:{ARRAY_RADIUS*1000:.1f} mm")
-    print(f"  FFT:         {NFFT} pts, hop {HOP_LENGTH}, overlap {OVERLAP}")
+    print("=" * 60)
+    print(" Beamforming — Sipeed 6+1 Array + Tang Nano 9K")
+    print("=" * 60)
+    print(f"  Port:       {SERIAL_PORT} @ {SERIAL_BAUD/1e6:.0f} Mbaud")
+    print(f"  Sample rate: {SAMPLE_RATE} Hz")
+    print(f"  Channels:    {CHANNELS}")
     print(f"  Beamformer:  {BEAMFORMER_TYPE}")
-    print(f"  Speech band: {FREQ_MIN}-{FREQ_MAX} Hz")
     print(f"  Direction:   az={AZIMUTH_FRONT}° el={ELEVATION_FRONT}°")
-    print(f"\n  Array gain:  ~{10*np.log10(CHANNELS):.1f} dB (delay-sum)")
-    print(f"  Null budget: {CHANNELS - 1} spatial nulls (MVDR)")
+    print(f"  Array gain:  ~{10*np.log10(CHANNELS):.1f} dB")
 
-    if BEAMFORMER_TYPE == 'MVDR':
-        beamformer = MVDRFrequencyBeamformer(MIC_POSITIONS, SAMPLE_RATE)
-    elif BEAMFORMER_TYPE == 'GEV':
-        beamformer = GEVFrequencyBeamformer(MIC_POSITIONS, SAMPLE_RATE)
-    else:
-        beamformer = DelayAndSumFrequencyBeamformer(MIC_POSITIONS, SAMPLE_RATE)
+    beamformer = TimeDomainBeamformer(MIC_POSITIONS, SAMPLE_RATE, CHUNK_SIZE)
+    agc = SmoothAGC()
+    print("Beamformer ready")
 
-    print(f"\nBeamformer initialized")
+    p = pyaudio.PyAudio()
+    print("\nAudio output devices:")
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxOutputChannels'] > 0:
+            print(f"  [{i}] {info['name']}")
 
-    p_audio = setup_audio_output()
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=SAMPLE_RATE,
+        output=True,
+        frames_per_buffer=CHUNK_SIZE * 2
+    )
+    print(f"Audio output: {SAMPLE_RATE} Hz mono")
 
-    print(f"\nConnecting to Tang Nano 9K on {SERIAL_PORT}...")
+    print(f"\nConnecting to {SERIAL_PORT}...")
     try:
         ser = RawSerialPort(SERIAL_PORT, SERIAL_BAUD, timeout=1)
         time.sleep(0.5)
         ser.reset_input_buffer()
-        print(f"Serial connected ({'pyserial' if ser._ser else 'raw I/O'})")
+        print(f"Connected ({'pyserial' if ser._ser else 'raw I/O'})")
     except Exception as e:
-        print(f"ERROR: Could not open serial port: {e}")
-        print("Check that the Tang Nano 9K is plugged in and the port is correct.")
+        print(f"ERROR: {e}")
         sys.exit(1)
 
-    audio_thread = threading.Thread(
-        target=read_audio_stream, args=(ser, beamformer), daemon=True)
-    direction_thread = threading.Thread(
-        target=direction_control_thread, daemon=True)
-    stats_t = threading.Thread(
-        target=stats_thread_fn, daemon=True)
+    audio_q = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
 
-    audio_thread.start()
-    direction_thread.start()
-    stats_t.start()
+    t_serial = threading.Thread(target=serial_reader_thread,
+                                args=(ser, audio_q), daemon=True)
+    t_playback = threading.Thread(target=audio_playback_thread,
+                                  args=(audio_q, beamformer, agc, stream), daemon=True)
+    t_stats = threading.Thread(target=stats_thread_fn, daemon=True)
 
-    print("\n" + "=" * 70)
-    print(" RUNNING — 7-channel beamforming active")
-    print(" Press Ctrl+C to stop")
-    print("=" * 70 + "\n")
+    t_serial.start()
+    t_playback.start()
+    t_stats.start()
+
+    print("\n" + "=" * 60)
+    print(" RUNNING — press Ctrl+C to stop")
+    print("=" * 60 + "\n")
 
     try:
         while True:
@@ -679,15 +465,13 @@ def main():
     except KeyboardInterrupt:
         print("\n\nShutting down...")
         running = False
-        time.sleep(1)
-
-        if audio_output:
-            audio_output.stop_stream()
-            audio_output.close()
-        p_audio.terminate()
+        time.sleep(0.5)
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
         ser.close()
-
         print("Done.")
+
 
 if __name__ == '__main__':
     main()
