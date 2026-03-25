@@ -184,13 +184,13 @@ ELEVATION_FRONT = 0.0
 FREQ_MIN = 200
 FREQ_MAX = 5000
 REGULARIZATION = 1e-3
+COV_SMOOTHING = 0.85   # exponential averaging of covariance (0=no memory, 1=frozen)
 
-AGC_TARGET = 0.75
-AGC_ATTACK = 0.02
-AGC_RELEASE = 0.0005
+AGC_TARGET = 0.80
+AGC_ATTACK = 0.1
+AGC_RELEASE = 0.005
 
-# Output buffer: holds chunks for smooth playback (absorbs processing jitter)
-OUTPUT_QUEUE_SIZE = 8
+OUTPUT_QUEUE_SIZE = 12
 
 # ============================================================================
 # GLOBAL STATE
@@ -206,10 +206,11 @@ stats = {'packets': 0, 'errors': 0, 'drops': 0}
 # ============================================================================
 
 class FastMVDRBeamformer:
-    """MVDR via single FFT + batch matrix ops.  No scipy STFT overhead.
+    """MVDR via single FFT + batch matrix ops, with running covariance.
 
-    All 257 frequency bins are processed with vectorized numpy (einsum),
-    making it ~50x faster than a Python for-loop over bins.
+    No windowing (chunk-by-chunk without overlap-add).
+    Covariance is exponentially averaged across chunks so MVDR has
+    a proper full-rank estimate instead of a degenerate rank-1 snapshot.
     """
 
     def __init__(self, mic_positions, sample_rate, n_samples):
@@ -220,20 +221,19 @@ class FastMVDRBeamformer:
         self.freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
         self.n_freqs = len(self.freqs)
 
-        self.window = np.hanning(n_samples).astype(np.float32)
-
-        self.fmin_idx = max(1, np.argmin(np.abs(self.freqs - FREQ_MIN)))
-        self.fmax_idx = np.argmin(np.abs(self.freqs - FREQ_MAX))
+        self.fmin_idx = max(1, int(np.argmin(np.abs(self.freqs - FREQ_MIN))))
+        self.fmax_idx = int(np.argmin(np.abs(self.freqs - FREQ_MAX)))
         self.n_band = self.fmax_idx - self.fmin_idx
 
         self.eye_reg = np.stack([np.eye(self.n_mics, dtype=complex) * REGULARIZATION]
                                 * self.n_band)
 
+        self.R_avg = None  # running covariance (n_band, M, M)
+
         self._cached_az = None
         self._cached_el = None
-        self._steering_full = None  # (n_freqs, n_mics)
-        self._steering_band = None  # (n_band, n_mics)
-        self._ds_weights = None     # delay-sum fallback for out-of-band
+        self._steering_band = None
+        self._ds_weights = None
 
     def _update_steering(self, azimuth_deg, elevation_deg):
         if self._cached_az == azimuth_deg and self._cached_el == elevation_deg:
@@ -243,28 +243,24 @@ class FastMVDRBeamformer:
         el = np.radians(elevation_deg)
         doa = np.array([np.cos(el)*np.cos(az), np.cos(el)*np.sin(az), np.sin(el)])
 
-        delays = self.mic_positions @ doa / SPEED_OF_SOUND  # (n_mics,)
-        omega = 2.0 * np.pi * self.freqs[:, None]           # (n_freqs, 1)
-        sv = np.exp(-1j * omega * delays[None, :])           # (n_freqs, n_mics)
+        delays = self.mic_positions @ doa / SPEED_OF_SOUND
+        omega = 2.0 * np.pi * self.freqs[:, None]
+        sv = np.exp(-1j * omega * delays[None, :])
         norms = np.linalg.norm(sv, axis=1, keepdims=True)
         sv /= (norms + 1e-12)
 
-        self._steering_full = sv
         self._steering_band = sv[self.fmin_idx:self.fmax_idx]
         self._ds_weights = sv / self.n_mics
-
         self._cached_az = azimuth_deg
         self._cached_el = elevation_deg
 
     def process(self, audio_chunk, azimuth_deg, elevation_deg=0):
         self._update_steering(azimuth_deg, elevation_deg)
 
-        windowed = audio_chunk * self.window[:, None]
-        X = np.fft.rfft(windowed, axis=0)  # (n_freqs, n_mics)
+        X = np.fft.rfft(audio_chunk, axis=0)  # (n_freqs, n_mics) — no window
 
         output = np.zeros(self.n_freqs, dtype=complex)
 
-        # Out-of-band: simple delay-and-sum (cheap)
         ds = self._ds_weights
         output[:self.fmin_idx] = np.einsum('fi,fi->f',
                                            ds[:self.fmin_idx].conj(),
@@ -273,13 +269,16 @@ class FastMVDRBeamformer:
                                            ds[self.fmax_idx:].conj(),
                                            X[self.fmax_idx:])
 
-        # In-band MVDR: batch covariance + batch solve
-        Xb = X[self.fmin_idx:self.fmax_idx]            # (n_band, n_mics)
-        ab = self._steering_band                        # (n_band, n_mics)
+        Xb = X[self.fmin_idx:self.fmax_idx]
+        ab = self._steering_band
 
-        # Rank-1 covariance from single snapshot + regularization
-        R = np.einsum('fi,fj->fij', Xb, Xb.conj())    # (n_band, M, M)
-        R += self.eye_reg
+        R_new = np.einsum('fi,fj->fij', Xb, Xb.conj())
+        if self.R_avg is None:
+            self.R_avg = R_new.copy()
+        else:
+            self.R_avg = COV_SMOOTHING * self.R_avg + (1 - COV_SMOOTHING) * R_new
+
+        R = self.R_avg + self.eye_reg
 
         try:
             R_inv_a = np.linalg.solve(R, ab[:, :, None]).squeeze(-1)
@@ -290,8 +289,7 @@ class FastMVDRBeamformer:
 
         output[self.fmin_idx:self.fmax_idx] = np.einsum('fi,fi->f', w.conj(), Xb)
 
-        result = np.fft.irfft(output, n=self.n_samples)
-        return result
+        return np.fft.irfft(output, n=self.n_samples)
 
 
 # ============================================================================
@@ -330,20 +328,38 @@ PACKET_DATA_SIZE = CHUNK_SIZE * CHANNELS * 2
 FULL_PACKET_SIZE = 6 + PACKET_DATA_SIZE   # 'MIC' + 2-byte len + 1-byte nch + data
 
 def serial_reader_thread(ser, audio_queue):
-    """Reads serial data in large chunks, extracts MIC packets, pushes audio."""
+    """Reads serial data in large chunks, extracts MIC packets, pushes audio.
+    Auto-recovers from read failures by flushing and resyncing.
+    """
     global running, stats
 
     buf = bytearray()
     CHUNK_READ = 8192
+    empty_count = 0
 
     while running:
         try:
             new_data = ser.read(CHUNK_READ)
             if not new_data:
-                time.sleep(0.001)
+                empty_count += 1
+                if empty_count > 50:
+                    # Connection seems dead — flush and resync
+                    print("\n[SERIAL] No data, resyncing...")
+                    buf.clear()
+                    ser.reset_input_buffer()
+                    empty_count = 0
+                    time.sleep(0.5)
+                else:
+                    time.sleep(0.002)
                 continue
 
+            empty_count = 0
             buf.extend(new_data)
+
+            # Prevent buffer from growing unbounded
+            if len(buf) > 200000:
+                buf = buf[-FULL_PACKET_SIZE * 2:]
+                stats['drops'] += 1
 
             while len(buf) >= FULL_PACKET_SIZE:
                 idx = buf.find(HEADER_MARKER)
@@ -386,9 +402,14 @@ def serial_reader_thread(ser, audio_queue):
                 stats['packets'] += 1
 
         except Exception as e:
-            print(f"\nSerial read error: {e}")
+            print(f"\n[SERIAL] Error: {e}, recovering...")
             stats['errors'] += 1
-            time.sleep(0.01)
+            buf.clear()
+            time.sleep(0.5)
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
 
 
 # ============================================================================
