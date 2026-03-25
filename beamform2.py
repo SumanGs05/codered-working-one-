@@ -282,9 +282,9 @@ class FastMVDRBeamformer:
         R += self.eye_reg
 
         try:
-            R_inv_a = np.linalg.solve(R, ab)            # (n_band, M)
-            den = np.einsum('fi,fi->f', ab.conj(), R_inv_a)  # (n_band,)
-            w = R_inv_a / (den[:, None] + 1e-12)        # (n_band, M)
+            R_inv_a = np.linalg.solve(R, ab[:, :, None]).squeeze(-1)
+            den = np.einsum('fi,fi->f', ab.conj(), R_inv_a)
+            w = R_inv_a / (den[:, None] + 1e-12)
         except np.linalg.LinAlgError:
             w = ab / self.n_mics
 
