@@ -177,14 +177,17 @@ MIC_POSITIONS = np.array([
 # BEAMFORMING PARAMETERS
 # ============================================================================
 
-BEAMFORMER_TYPE = 'DelaySum'   # 'DelaySum' (fast/clear) or 'MVDR' (heavy but sharper)
+BEAMFORMER_TYPE = 'MVDR'
 AZIMUTH_FRONT = 0.0
 ELEVATION_FRONT = 0.0
 
-# AGC (Automatic Gain Control) — smooth gain to avoid pumping artifacts
+FREQ_MIN = 200
+FREQ_MAX = 5000
+REGULARIZATION = 1e-3
+
 AGC_TARGET = 0.75
-AGC_ATTACK = 0.02    # fast attack for sudden loud sounds
-AGC_RELEASE = 0.0005  # slow release for smooth gain recovery
+AGC_ATTACK = 0.02
+AGC_RELEASE = 0.0005
 
 # Output buffer: holds chunks for smooth playback (absorbs processing jitter)
 OUTPUT_QUEUE_SIZE = 8
@@ -199,15 +202,14 @@ running = True
 stats = {'packets': 0, 'errors': 0, 'drops': 0}
 
 # ============================================================================
-# TIME-DOMAIN DELAY-AND-SUM BEAMFORMER (fast, Pi-friendly)
+# VECTORIZED MVDR BEAMFORMER (batch numpy, no Python loops over freq bins)
 # ============================================================================
 
-class TimeDomainBeamformer:
-    """Delay-and-sum in frequency domain (one FFT cycle, no STFT overhead).
+class FastMVDRBeamformer:
+    """MVDR via single FFT + batch matrix ops.  No scipy STFT overhead.
 
-    For a 35mm circular array at 16kHz, max inter-mic delay is ~1.6 samples.
-    We apply fractional delays via phase shifts in a single FFT/IFFT pair,
-    which is far cheaper than full STFT-based MVDR.
+    All 257 frequency bins are processed with vectorized numpy (einsum),
+    making it ~50x faster than a Python for-loop over bins.
     """
 
     def __init__(self, mic_positions, sample_rate, n_samples):
@@ -216,40 +218,80 @@ class TimeDomainBeamformer:
         self.sample_rate = sample_rate
         self.n_samples = n_samples
         self.freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+        self.n_freqs = len(self.freqs)
+
+        self.window = np.hanning(n_samples).astype(np.float32)
+
+        self.fmin_idx = max(1, np.argmin(np.abs(self.freqs - FREQ_MIN)))
+        self.fmax_idx = np.argmin(np.abs(self.freqs - FREQ_MAX))
+        self.n_band = self.fmax_idx - self.fmin_idx
+
+        self.eye_reg = np.stack([np.eye(self.n_mics, dtype=complex) * REGULARIZATION]
+                                * self.n_band)
+
         self._cached_az = None
         self._cached_el = None
-        self._cached_shifts = None
+        self._steering_full = None  # (n_freqs, n_mics)
+        self._steering_band = None  # (n_band, n_mics)
+        self._ds_weights = None     # delay-sum fallback for out-of-band
 
-    def _compute_delay_filters(self, azimuth_deg, elevation_deg):
+    def _update_steering(self, azimuth_deg, elevation_deg):
         if self._cached_az == azimuth_deg and self._cached_el == elevation_deg:
-            return self._cached_shifts
+            return
 
         az = np.radians(azimuth_deg)
         el = np.radians(elevation_deg)
         doa = np.array([np.cos(el)*np.cos(az), np.cos(el)*np.sin(az), np.sin(el)])
 
-        delays = self.mic_positions @ doa / SPEED_OF_SOUND
-        delays -= delays.mean()
+        delays = self.mic_positions @ doa / SPEED_OF_SOUND  # (n_mics,)
+        omega = 2.0 * np.pi * self.freqs[:, None]           # (n_freqs, 1)
+        sv = np.exp(-1j * omega * delays[None, :])           # (n_freqs, n_mics)
+        norms = np.linalg.norm(sv, axis=1, keepdims=True)
+        sv /= (norms + 1e-12)
 
-        shifts = np.zeros((self.n_mics, len(self.freqs)), dtype=complex)
-        for m in range(self.n_mics):
-            shifts[m] = np.exp(-1j * 2 * np.pi * self.freqs * (-delays[m]))
+        self._steering_full = sv
+        self._steering_band = sv[self.fmin_idx:self.fmax_idx]
+        self._ds_weights = sv / self.n_mics
 
         self._cached_az = azimuth_deg
         self._cached_el = elevation_deg
-        self._cached_shifts = shifts
-        return shifts
 
     def process(self, audio_chunk, azimuth_deg, elevation_deg=0):
-        shifts = self._compute_delay_filters(azimuth_deg, elevation_deg)
+        self._update_steering(azimuth_deg, elevation_deg)
 
-        aligned_sum = np.zeros(len(self.freqs), dtype=complex)
-        for m in range(self.n_mics):
-            spectrum = np.fft.rfft(audio_chunk[:, m])
-            aligned_sum += spectrum * shifts[m]
+        windowed = audio_chunk * self.window[:, None]
+        X = np.fft.rfft(windowed, axis=0)  # (n_freqs, n_mics)
 
-        aligned_sum /= self.n_mics
-        return np.fft.irfft(aligned_sum, n=self.n_samples)
+        output = np.zeros(self.n_freqs, dtype=complex)
+
+        # Out-of-band: simple delay-and-sum (cheap)
+        ds = self._ds_weights
+        output[:self.fmin_idx] = np.einsum('fi,fi->f',
+                                           ds[:self.fmin_idx].conj(),
+                                           X[:self.fmin_idx])
+        output[self.fmax_idx:] = np.einsum('fi,fi->f',
+                                           ds[self.fmax_idx:].conj(),
+                                           X[self.fmax_idx:])
+
+        # In-band MVDR: batch covariance + batch solve
+        Xb = X[self.fmin_idx:self.fmax_idx]            # (n_band, n_mics)
+        ab = self._steering_band                        # (n_band, n_mics)
+
+        # Rank-1 covariance from single snapshot + regularization
+        R = np.einsum('fi,fj->fij', Xb, Xb.conj())    # (n_band, M, M)
+        R += self.eye_reg
+
+        try:
+            R_inv_a = np.linalg.solve(R, ab)            # (n_band, M)
+            den = np.einsum('fi,fi->f', ab.conj(), R_inv_a)  # (n_band,)
+            w = R_inv_a / (den[:, None] + 1e-12)        # (n_band, M)
+        except np.linalg.LinAlgError:
+            w = ab / self.n_mics
+
+        output[self.fmin_idx:self.fmax_idx] = np.einsum('fi,fi->f', w.conj(), Xb)
+
+        result = np.fft.irfft(output, n=self.n_samples)
+        return result
 
 
 # ============================================================================
@@ -413,9 +455,10 @@ def main():
     print(f"  Direction:   az={AZIMUTH_FRONT}° el={ELEVATION_FRONT}°")
     print(f"  Array gain:  ~{10*np.log10(CHANNELS):.1f} dB")
 
-    beamformer = TimeDomainBeamformer(MIC_POSITIONS, SAMPLE_RATE, CHUNK_SIZE)
+    beamformer = FastMVDRBeamformer(MIC_POSITIONS, SAMPLE_RATE, CHUNK_SIZE)
     agc = SmoothAGC()
-    print("Beamformer ready")
+    print(f"MVDR beamformer ready ({beamformer.n_band} active bins, "
+          f"{FREQ_MIN}-{FREQ_MAX} Hz)")
 
     p = pyaudio.PyAudio()
     print("\nAudio output devices:")
