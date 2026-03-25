@@ -1,0 +1,64 @@
+// ============================================================
+//  Tang Nano 9K  —  Pin Constraints for Mic Array Project
+// ============================================================
+//
+//  IMPORTANT: Verify these pin numbers against your physical
+//  wiring and the Tang Nano 9K schematic / silkscreen before
+//  programming.  Pins 25-56 are on the 3.3 V header I/O banks.
+//
+//  Sipeed mic array connector pinout (10-pin):
+//    1 VIN   2 GND   3 MIC_D0   4 MIC_D1
+//    5 MIC_D2   6 MIC_D3   7 MIC_WS   8 MIC_CK
+//    9 LED_CK  10 LED_DA
+// ============================================================
+
+// ----- System clock (27 MHz onboard oscillator) -----
+IO_LOC  "sys_clk"    52;
+IO_PORT "sys_clk"    IO_TYPE=LVCMOS33;
+
+// ----- Reset button (active-low, Button S1) -----
+IO_LOC  "btn_rst_n"  4;
+IO_PORT "btn_rst_n"  IO_TYPE=LVCMOS18 PULL_MODE=UP;
+
+// ----- USB-UART TX (FPGA → BL702 → USB) -----
+IO_LOC  "uart_txd"   17;
+IO_PORT "uart_txd"   IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ----- Mic array: I2S clocks (FPGA outputs) -----
+IO_LOC  "mic_bclk"   42;
+IO_PORT "mic_bclk"   IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC  "mic_ws"     41;
+IO_PORT "mic_ws"     IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ----- Mic array: I2S data lines (FPGA inputs) -----
+IO_LOC  "mic_d0"     25;
+IO_PORT "mic_d0"     IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+IO_LOC  "mic_d1"     26;
+IO_PORT "mic_d1"     IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+IO_LOC  "mic_d2"     27;
+IO_PORT "mic_d2"     IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+IO_LOC  "mic_d3"     28;
+IO_PORT "mic_d3"     IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+// ----- Onboard LEDs (active-low, 1.8 V Bank 3) -----
+IO_LOC  "led[0]"     10;
+IO_PORT "led[0]"     IO_TYPE=LVCMOS18;
+
+IO_LOC  "led[1]"     11;
+IO_PORT "led[1]"     IO_TYPE=LVCMOS18;
+
+IO_LOC  "led[2]"     13;
+IO_PORT "led[2]"     IO_TYPE=LVCMOS18;
+
+IO_LOC  "led[3]"     14;
+IO_PORT "led[3]"     IO_TYPE=LVCMOS18;
+
+IO_LOC  "led[4]"     15;
+IO_PORT "led[4]"     IO_TYPE=LVCMOS18;
+
+IO_LOC  "led[5]"     16;
+IO_PORT "led[5]"     IO_TYPE=LVCMOS18;
