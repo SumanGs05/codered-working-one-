@@ -14,8 +14,6 @@ Channel mapping (from FPGA i2s_receiver):
   ch6 = D3 left  → mic 6 (center)
 """
 
-import serial
-import serial.tools.list_ports
 import struct
 import numpy as np
 import pyaudio
@@ -26,31 +24,128 @@ import threading
 import time
 import sys
 import platform
+import os
+import subprocess
 
 # ============================================================================
 # SERIAL CONFIGURATION  (Tang Nano 9K via BL702 USB-UART)
 # ============================================================================
 
+SERIAL_BAUD = 3_000_000
+
 def find_serial_port():
     """Auto-detect Tang Nano 9K COM port"""
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        desc = (p.description or '').lower()
-        hwid = (p.hwid or '').lower()
-        if any(k in desc for k in ['bl702', 'tang', 'gowin', 'usb serial', 'usb-serial']):
-            return p.device
     if platform.system() == 'Windows':
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            desc = (p.description or '').lower()
+            if any(k in desc for k in ['bl702', 'tang', 'gowin', 'usb serial', 'usb-serial']):
+                return p.device
         for p in ports:
             if 'COM' in p.device:
                 return p.device
+        return 'COM3'
     else:
-        for p in ports:
-            if 'ttyACM' in p.device or 'ttyUSB' in p.device:
-                return p.device
-    return None
+        for dev in ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyAMA0']:
+            if os.path.exists(dev):
+                return dev
+        return '/dev/ttyUSB1'
 
-SERIAL_PORT = find_serial_port() or ('COM3' if platform.system() == 'Windows' else '/dev/ttyACM0')
-SERIAL_BAUD = 3_000_000
+
+class RawSerialPort:
+    """Raw serial reader that bypasses pyserial on Linux.
+
+    The BL702 chip on the Tang Nano 9K crashes when pyserial sends
+    DTR/RTS modem control signals during open().  This class uses
+    stty + os.open(O_NOCTTY) to avoid that entirely.
+    On Windows, falls back to pyserial which works fine.
+    """
+
+    def __init__(self, port, baudrate, timeout=1):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self._fd = None
+        self._ser = None
+        self._buf = b''
+
+        if platform.system() == 'Windows':
+            import serial
+            self._ser = serial.Serial(port, baudrate, timeout=timeout)
+        else:
+            self._init_linux()
+
+    def _init_linux(self):
+        latency_path = None
+        dev_name = os.path.basename(self.port)
+        lt = f'/sys/bus/usb-serial/devices/{dev_name}/latency_timer'
+        if os.path.exists(lt):
+            try:
+                subprocess.run(['sudo', 'tee', lt],
+                               input=b'1', capture_output=True, timeout=5)
+                latency_path = lt
+            except Exception:
+                pass
+
+        subprocess.run([
+            'stty', '-F', self.port,
+            str(self.baudrate), 'raw', '-echo', '-crtscts', '-clocal'
+        ], check=True, timeout=5)
+
+        self._fd = os.open(self.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+
+        import select
+        self._poll = select.poll()
+        self._poll.register(self._fd, select.POLLIN)
+
+    def read(self, size):
+        if self._ser is not None:
+            return self._ser.read(size)
+
+        data = bytearray()
+        deadline = time.monotonic() + self.timeout
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_ms = max(1, int(remaining * 1000))
+            events = self._poll.poll(wait_ms)
+            if events:
+                try:
+                    chunk = os.read(self._fd, size - len(data))
+                    if chunk:
+                        data.extend(chunk)
+                except BlockingIOError:
+                    pass
+        return bytes(data)
+
+    def reset_input_buffer(self):
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
+            return
+        try:
+            import termios
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+        except Exception:
+            while True:
+                events = self._poll.poll(0)
+                if not events:
+                    break
+                try:
+                    os.read(self._fd, 65536)
+                except BlockingIOError:
+                    break
+
+    def close(self):
+        if self._ser is not None:
+            self._ser.close()
+        elif self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
+SERIAL_PORT = find_serial_port()
 
 # ============================================================================
 # AUDIO / FPGA PARAMETERS
@@ -553,15 +648,13 @@ def main():
 
     print(f"\nConnecting to Tang Nano 9K on {SERIAL_PORT}...")
     try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        time.sleep(1)
+        ser = RawSerialPort(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+        time.sleep(0.5)
         ser.reset_input_buffer()
-        print(f"Serial connected")
+        print(f"Serial connected ({'pyserial' if ser._ser else 'raw I/O'})")
     except Exception as e:
         print(f"ERROR: Could not open serial port: {e}")
-        print("Check that the Tang Nano 9K is plugged in and the COM port is correct.")
-        avail = [p.device for p in serial.tools.list_ports.comports()]
-        print(f"Available ports: {avail}")
+        print("Check that the Tang Nano 9K is plugged in and the port is correct.")
         sys.exit(1)
 
     audio_thread = threading.Thread(
