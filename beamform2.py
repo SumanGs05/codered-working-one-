@@ -157,8 +157,8 @@ CHANNELS = 7              # all 7 real mics from FPGA
 CHUNK_SIZE = 512           # frames per packet (matches FPGA packetizer)
 BITS_PER_SAMPLE = 16
 
-# STFT parameters — larger FFT for better frequency resolution with 7 mics
-NFFT = 1024
+# STFT parameters — must fit within CHUNK_SIZE (512 samples per packet)
+NFFT = 512
 OVERLAP = NFFT * 3 // 4   # 75% overlap for better time resolution
 HOP_LENGTH = NFFT - OVERLAP
 
