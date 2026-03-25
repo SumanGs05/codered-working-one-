@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-Real-time Audio Beamforming for Sipeed 6+1 Mic Array
-via Tang Nano 9K FPGA — optimized for Raspberry Pi 4B
+Real-time MVDR Beamforming — Sipeed 6+1 Mic Array + Tang Nano 9K
+Designed for Raspberry Pi 4B real-time operation.
+
+Architecture:
+  [serial_reader] --Queue--> [processor] --Queue--> [audio_writer]
+
+Key design choices:
+  - Noise calibration phase (first few seconds) builds a clean noise
+    covariance matrix.  MVDR then uses this FIXED noise estimate so it
+    never self-cancels the target signal.
+  - Overlap-add synthesis with Hanning window eliminates chunk-boundary
+    clicks.
+  - Vectorized batch numpy (einsum + batched solve) — zero Python loops
+    over frequency bins.
+  - Short serial timeout (100ms) so USB hiccups don't cause 1-second gaps.
 
 Channel mapping (from FPGA i2s_receiver):
-  ch0 = D0 left  → mic 0 (outer, 0°)
-  ch1 = D0 right → mic 1 (outer, 60°)
-  ch2 = D1 left  → mic 2 (outer, 120°)
-  ch3 = D1 right → mic 3 (outer, 180°)
-  ch4 = D2 left  → mic 4 (outer, 240°)
-  ch5 = D2 right → mic 5 (outer, 300°)
-  ch6 = D3 left  → mic 6 (center)
+  ch0 = D0 left  -> mic 0 (outer, 0 deg)
+  ch1 = D0 right -> mic 1 (outer, 60 deg)
+  ch2 = D1 left  -> mic 2 (outer, 120 deg)
+  ch3 = D1 right -> mic 3 (outer, 180 deg)
+  ch4 = D2 left  -> mic 4 (outer, 240 deg)
+  ch5 = D2 right -> mic 5 (outer, 300 deg)
+  ch6 = D3 left  -> mic 6 (center)
 """
 
 import struct
 import numpy as np
 import pyaudio
-from collections import deque
 import threading
 import queue
 import time
@@ -26,7 +38,7 @@ import os
 import subprocess
 
 # ============================================================================
-# SERIAL CONFIGURATION
+# SERIAL
 # ============================================================================
 
 SERIAL_BAUD = 3_000_000
@@ -34,31 +46,30 @@ SERIAL_BAUD = 3_000_000
 def find_serial_port():
     if platform.system() == 'Windows':
         import serial.tools.list_ports
-        ports = serial.tools.list_ports.comports()
-        for p in ports:
+        for p in serial.tools.list_ports.comports():
             desc = (p.description or '').lower()
-            if any(k in desc for k in ['bl702', 'tang', 'gowin', 'usb serial', 'usb-serial']):
+            if any(k in desc for k in ['bl702', 'tang', 'gowin', 'usb serial']):
                 return p.device
-        for p in ports:
+        for p in serial.tools.list_ports.comports():
             if 'COM' in p.device:
                 return p.device
         return 'COM3'
-    else:
-        for dev in ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyAMA0']:
-            if os.path.exists(dev):
-                return dev
-        return '/dev/ttyUSB1'
+    for dev in ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyAMA0']:
+        if os.path.exists(dev):
+            return dev
+    return '/dev/ttyUSB1'
 
 
 class RawSerialPort:
-    """Raw serial reader bypassing pyserial on Linux (BL702 workaround)."""
+    """Bypasses pyserial on Linux (BL702 crashes on DTR/RTS toggle)."""
 
-    def __init__(self, port, baudrate, timeout=1):
+    def __init__(self, port, baudrate, timeout=0.1):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self._fd = None
         self._ser = None
+        self._poll = None
 
         if platform.system() == 'Windows':
             import serial
@@ -75,12 +86,10 @@ class RawSerialPort:
                                input=b'1', capture_output=True, timeout=5)
             except Exception:
                 pass
-
         subprocess.run([
             'stty', '-F', self.port,
             str(self.baudrate), 'raw', '-echo', '-crtscts', '-clocal'
         ], check=True, timeout=5)
-
         self._fd = os.open(self.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
         import select
         self._poll = select.poll()
@@ -89,15 +98,13 @@ class RawSerialPort:
     def read(self, size):
         if self._ser is not None:
             return self._ser.read(size)
-
         data = bytearray()
         deadline = time.monotonic() + self.timeout
         while len(data) < size:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            wait_ms = max(1, int(remaining * 1000))
-            events = self._poll.poll(wait_ms)
+            events = self._poll.poll(max(1, int(remaining * 1000)))
             if events:
                 try:
                     chunk = os.read(self._fd, size - len(data))
@@ -106,19 +113,6 @@ class RawSerialPort:
                 except BlockingIOError:
                     pass
         return bytes(data)
-
-    def read_available(self, max_size=65536):
-        """Non-blocking read of whatever is available."""
-        if self._ser is not None:
-            waiting = self._ser.in_waiting
-            if waiting > 0:
-                return self._ser.read(min(waiting, max_size))
-            return b''
-
-        try:
-            return os.read(self._fd, max_size)
-        except BlockingIOError:
-            return b''
 
     def reset_input_buffer(self):
         if self._ser is not None:
@@ -148,99 +142,97 @@ class RawSerialPort:
 SERIAL_PORT = find_serial_port()
 
 # ============================================================================
-# AUDIO / FPGA PARAMETERS
+# PARAMETERS
 # ============================================================================
 
 SAMPLE_RATE = 16226
 CHANNELS = 7
 CHUNK_SIZE = 512
-BITS_PER_SAMPLE = 16
 SPEED_OF_SOUND = 343.0
-
-# ============================================================================
-# MICROPHONE ARRAY GEOMETRY
-# ============================================================================
-
 ARRAY_RADIUS = 0.035
 
 MIC_POSITIONS = np.array([
-    [ARRAY_RADIUS * np.cos(np.radians(  0)), ARRAY_RADIUS * np.sin(np.radians(  0)), 0.0],
-    [ARRAY_RADIUS * np.cos(np.radians( 60)), ARRAY_RADIUS * np.sin(np.radians( 60)), 0.0],
-    [ARRAY_RADIUS * np.cos(np.radians(120)), ARRAY_RADIUS * np.sin(np.radians(120)), 0.0],
-    [ARRAY_RADIUS * np.cos(np.radians(180)), ARRAY_RADIUS * np.sin(np.radians(180)), 0.0],
-    [ARRAY_RADIUS * np.cos(np.radians(240)), ARRAY_RADIUS * np.sin(np.radians(240)), 0.0],
-    [ARRAY_RADIUS * np.cos(np.radians(300)), ARRAY_RADIUS * np.sin(np.radians(300)), 0.0],
-    [0.0, 0.0, 0.0],
-])
+    [ARRAY_RADIUS * np.cos(np.radians(a)), ARRAY_RADIUS * np.sin(np.radians(a)), 0.0]
+    for a in [0, 60, 120, 180, 240, 300]
+] + [[0.0, 0.0, 0.0]])
 
-# ============================================================================
-# BEAMFORMING PARAMETERS
-# ============================================================================
-
-BEAMFORMER_TYPE = 'MVDR'
-AZIMUTH_FRONT = 0.0
-ELEVATION_FRONT = 0.0
-
+# MVDR
 FREQ_MIN = 200
 FREQ_MAX = 5000
 REGULARIZATION = 1e-3
-COV_SMOOTHING = 0.85   # exponential averaging of covariance (0=no memory, 1=frozen)
+NOISE_CAL_SECONDS = 3       # seconds of silence to calibrate noise
 
+# Overlap-add: process 2*CHUNK_SIZE with 50% overlap for click-free output
+OLA_NFFT = CHUNK_SIZE * 2   # 1024 samples
+OLA_HOP = CHUNK_SIZE         # 512 samples (50% overlap)
+
+# AGC
 AGC_TARGET = 0.80
-AGC_ATTACK = 0.1
-AGC_RELEASE = 0.005
+AGC_ATTACK = 0.15
+AGC_RELEASE = 0.008
 
-OUTPUT_QUEUE_SIZE = 12
+# Pipeline
+INPUT_QUEUE_SIZE = 16
+OUTPUT_QUEUE_SIZE = 16
+
+# Direction
+AZIMUTH = 0.0
+ELEVATION = 0.0
 
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
 
-current_azimuth = AZIMUTH_FRONT
-current_elevation = ELEVATION_FRONT
 running = True
-stats = {'packets': 0, 'errors': 0, 'drops': 0}
+stats = {'packets': 0, 'errors': 0, 'drops': 0, 'phase': 'init'}
 
 # ============================================================================
-# VECTORIZED MVDR BEAMFORMER (batch numpy, no Python loops over freq bins)
+# MVDR BEAMFORMER WITH NOISE CALIBRATION + OVERLAP-ADD
 # ============================================================================
 
-class FastMVDRBeamformer:
-    """MVDR via single FFT + batch matrix ops, with running covariance.
-
-    No windowing (chunk-by-chunk without overlap-add).
-    Covariance is exponentially averaged across chunks so MVDR has
-    a proper full-rank estimate instead of a degenerate rank-1 snapshot.
-    """
-
-    def __init__(self, mic_positions, sample_rate, n_samples):
-        self.mic_positions = mic_positions
+class MVDRBeamformer:
+    def __init__(self, mic_positions, sample_rate):
         self.n_mics = len(mic_positions)
+        self.mic_positions = mic_positions
         self.sample_rate = sample_rate
-        self.n_samples = n_samples
-        self.freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+
+        self.nfft = OLA_NFFT
+        self.hop = OLA_HOP
+        self.freqs = np.fft.rfftfreq(self.nfft, 1.0 / sample_rate)
         self.n_freqs = len(self.freqs)
 
-        self.fmin_idx = max(1, int(np.argmin(np.abs(self.freqs - FREQ_MIN))))
-        self.fmax_idx = int(np.argmin(np.abs(self.freqs - FREQ_MAX)))
-        self.n_band = self.fmax_idx - self.fmin_idx
+        self.fmin = max(1, int(np.argmin(np.abs(self.freqs - FREQ_MIN))))
+        self.fmax = int(np.argmin(np.abs(self.freqs - FREQ_MAX)))
+        self.n_band = self.fmax - self.fmin
 
-        self.eye_reg = np.stack([np.eye(self.n_mics, dtype=complex) * REGULARIZATION]
-                                * self.n_band)
+        # Synthesis window (sqrt-Hann for perfect reconstruction with 50% overlap)
+        self.win_analysis = np.sqrt(np.hanning(self.nfft)).astype(np.float32)
+        self.win_synthesis = self.win_analysis.copy()
 
-        self.R_avg = None  # running covariance (n_band, M, M)
+        # Noise covariance (calibrated, then frozen)
+        self.R_noise = None
+        self.noise_frames = []
+        self.calibrated = False
 
+        # Previous chunk for overlap-add
+        self.prev_chunk = np.zeros(self.hop, dtype=np.float32)
+
+        # Steering vectors (cached)
         self._cached_az = None
         self._cached_el = None
-        self._steering_band = None
+        self._sv_band = None
         self._ds_weights = None
 
-    def _update_steering(self, azimuth_deg, elevation_deg):
-        if self._cached_az == azimuth_deg and self._cached_el == elevation_deg:
-            return
+        # Pre-allocate regularization
+        self.eye_reg = np.stack(
+            [np.eye(self.n_mics, dtype=complex) * REGULARIZATION] * self.n_band
+        )
 
-        az = np.radians(azimuth_deg)
-        el = np.radians(elevation_deg)
+    def _update_steering(self, az_deg, el_deg):
+        if self._cached_az == az_deg and self._cached_el == el_deg:
+            return
+        az = np.radians(az_deg)
+        el = np.radians(el_deg)
         doa = np.array([np.cos(el)*np.cos(az), np.cos(el)*np.sin(az), np.sin(el)])
 
         delays = self.mic_positions @ doa / SPEED_OF_SOUND
@@ -249,36 +241,85 @@ class FastMVDRBeamformer:
         norms = np.linalg.norm(sv, axis=1, keepdims=True)
         sv /= (norms + 1e-12)
 
-        self._steering_band = sv[self.fmin_idx:self.fmax_idx]
+        self._sv_band = sv[self.fmin:self.fmax]
         self._ds_weights = sv / self.n_mics
-        self._cached_az = azimuth_deg
-        self._cached_el = elevation_deg
+        self._cached_az = az_deg
+        self._cached_el = el_deg
 
-    def process(self, audio_chunk, azimuth_deg, elevation_deg=0):
-        self._update_steering(azimuth_deg, elevation_deg)
+    def feed_noise(self, chunk_7ch):
+        """Accumulate noise frames during calibration phase."""
+        self.noise_frames.append(chunk_7ch.copy())
 
-        X = np.fft.rfft(audio_chunk, axis=0)  # (n_freqs, n_mics) — no window
+    def finish_calibration(self):
+        """Build noise covariance from accumulated frames."""
+        if not self.noise_frames:
+            self.R_noise = self.eye_reg.copy()
+            self.calibrated = True
+            return
 
-        output = np.zeros(self.n_freqs, dtype=complex)
+        all_noise = np.concatenate(self.noise_frames, axis=0)
+        n_full = (len(all_noise) // self.nfft) * self.nfft
+        if n_full < self.nfft:
+            self.R_noise = self.eye_reg.copy()
+            self.calibrated = True
+            return
 
+        all_noise = all_noise[:n_full]
+        n_segments = n_full // self.hop - 1
+
+        R_acc = np.zeros((self.n_band, self.n_mics, self.n_mics), dtype=complex)
+        count = 0
+
+        for i in range(n_segments):
+            seg = all_noise[i * self.hop: i * self.hop + self.nfft]
+            windowed = seg * self.win_analysis[:, None]
+            X = np.fft.rfft(windowed, axis=0)
+            Xb = X[self.fmin:self.fmax]
+            R_acc += np.einsum('fi,fj->fij', Xb, Xb.conj())
+            count += 1
+
+        if count > 0:
+            R_acc /= count
+
+        self.R_noise = R_acc + self.eye_reg
+        self.noise_frames = []
+        self.calibrated = True
+        print(f"\n  Noise calibration done ({count} segments, "
+              f"{len(all_noise)/self.sample_rate:.1f}s)")
+
+    def process(self, prev_chunk, curr_chunk, az_deg, el_deg=0):
+        """Process two consecutive chunks with overlap-add.
+
+        prev_chunk: (CHUNK_SIZE, 7) — previous 512 samples
+        curr_chunk: (CHUNK_SIZE, 7) — current 512 samples
+        Returns: (CHUNK_SIZE,) — output audio for current hop
+        """
+        self._update_steering(az_deg, el_deg)
+
+        # Concatenate for OLA_NFFT = 1024 samples
+        frame = np.concatenate([prev_chunk, curr_chunk], axis=0)  # (1024, 7)
+
+        # Windowed FFT
+        windowed = frame * self.win_analysis[:, None]
+        X = np.fft.rfft(windowed, axis=0)  # (n_freqs, 7)
+
+        output_spectrum = np.zeros(self.n_freqs, dtype=complex)
+
+        # Out-of-band: delay-and-sum
         ds = self._ds_weights
-        output[:self.fmin_idx] = np.einsum('fi,fi->f',
-                                           ds[:self.fmin_idx].conj(),
-                                           X[:self.fmin_idx])
-        output[self.fmax_idx:] = np.einsum('fi,fi->f',
-                                           ds[self.fmax_idx:].conj(),
-                                           X[self.fmax_idx:])
+        output_spectrum[:self.fmin] = np.einsum(
+            'fi,fi->f', ds[:self.fmin].conj(), X[:self.fmin])
+        output_spectrum[self.fmax:] = np.einsum(
+            'fi,fi->f', ds[self.fmax:].conj(), X[self.fmax:])
 
-        Xb = X[self.fmin_idx:self.fmax_idx]
-        ab = self._steering_band
+        # In-band: MVDR with calibrated noise covariance
+        Xb = X[self.fmin:self.fmax]
+        ab = self._sv_band
 
-        R_new = np.einsum('fi,fj->fij', Xb, Xb.conj())
-        if self.R_avg is None:
-            self.R_avg = R_new.copy()
+        if self.calibrated and self.R_noise is not None:
+            R = self.R_noise
         else:
-            self.R_avg = COV_SMOOTHING * self.R_avg + (1 - COV_SMOOTHING) * R_new
-
-        R = self.R_avg + self.eye_reg
+            R = np.einsum('fi,fj->fij', Xb, Xb.conj()) + self.eye_reg
 
         try:
             R_inv_a = np.linalg.solve(R, ab[:, :, None]).squeeze(-1)
@@ -287,176 +328,201 @@ class FastMVDRBeamformer:
         except np.linalg.LinAlgError:
             w = ab / self.n_mics
 
-        output[self.fmin_idx:self.fmax_idx] = np.einsum('fi,fi->f', w.conj(), Xb)
+        output_spectrum[self.fmin:self.fmax] = np.einsum('fi,fi->f', w.conj(), Xb)
 
-        return np.fft.irfft(output, n=self.n_samples)
+        # IFFT + synthesis window
+        time_out = np.fft.irfft(output_spectrum, n=self.nfft)
+        time_out *= self.win_synthesis
+
+        # Overlap-add: second half of previous + first half of current
+        result = self.prev_chunk + time_out[:self.hop]
+        self.prev_chunk = time_out[self.hop:].astype(np.float32)
+
+        return result.astype(np.float32)
 
 
 # ============================================================================
-# SIMPLE AGC (smooth, no pumping)
+# SMOOTH AGC
 # ============================================================================
 
 class SmoothAGC:
-    def __init__(self, target=AGC_TARGET, attack=AGC_ATTACK, release=AGC_RELEASE):
-        self.target = target
-        self.attack = attack
-        self.release = release
+    def __init__(self):
         self.gain = 1.0
 
     def apply(self, signal):
         peak = np.max(np.abs(signal))
         if peak < 1e-8:
             return signal
-
-        desired_gain = self.target / peak
-
-        if desired_gain < self.gain:
-            self.gain += self.attack * (desired_gain - self.gain)
-        else:
-            self.gain += self.release * (desired_gain - self.gain)
-
-        self.gain = np.clip(self.gain, 0.01, 50.0)
+        desired = AGC_TARGET / peak
+        rate = AGC_ATTACK if desired < self.gain else AGC_RELEASE
+        self.gain += rate * (desired - self.gain)
+        self.gain = np.clip(self.gain, 0.1, 100.0)
         return signal * self.gain
 
 
 # ============================================================================
-# SERIAL PACKET READER (buffered, efficient)
+# SERIAL READER THREAD
 # ============================================================================
 
-HEADER_MARKER = b'MIC'
-PACKET_DATA_SIZE = CHUNK_SIZE * CHANNELS * 2
-FULL_PACKET_SIZE = 6 + PACKET_DATA_SIZE   # 'MIC' + 2-byte len + 1-byte nch + data
+HEADER = b'MIC'
+PKT_PAYLOAD = CHUNK_SIZE * CHANNELS * 2
+PKT_TOTAL = 6 + PKT_PAYLOAD
 
-def serial_reader_thread(ser, audio_queue):
-    """Reads serial data in large chunks, extracts MIC packets, pushes audio.
-    Auto-recovers from read failures by flushing and resyncing.
-    """
+
+def serial_reader_thread(ser, input_q):
     global running, stats
-
     buf = bytearray()
-    CHUNK_READ = 8192
-    empty_count = 0
+    empty_streak = 0
 
     while running:
         try:
-            new_data = ser.read(CHUNK_READ)
-            if not new_data:
-                empty_count += 1
-                if empty_count > 50:
-                    # Connection seems dead — flush and resync
-                    print("\n[SERIAL] No data, resyncing...")
+            data = ser.read(8192)
+            if not data:
+                empty_streak += 1
+                if empty_streak > 20:
                     buf.clear()
-                    ser.reset_input_buffer()
-                    empty_count = 0
-                    time.sleep(0.5)
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    empty_streak = 0
+                    time.sleep(0.2)
                 else:
-                    time.sleep(0.002)
+                    time.sleep(0.005)
                 continue
 
-            empty_count = 0
-            buf.extend(new_data)
+            empty_streak = 0
+            buf.extend(data)
 
-            # Prevent buffer from growing unbounded
-            if len(buf) > 200000:
-                buf = buf[-FULL_PACKET_SIZE * 2:]
+            if len(buf) > 150000:
+                buf = buf[-PKT_TOTAL * 3:]
                 stats['drops'] += 1
 
-            while len(buf) >= FULL_PACKET_SIZE:
-                idx = buf.find(HEADER_MARKER)
+            while len(buf) >= PKT_TOTAL:
+                idx = buf.find(HEADER)
                 if idx < 0:
                     buf = buf[-2:]
                     break
-
                 if idx > 0:
                     buf = buf[idx:]
-
                 if len(buf) < 6:
                     break
 
-                n_samples = struct.unpack('<H', buf[3:5])[0]
-                n_channels = buf[5]
+                ns = struct.unpack('<H', buf[3:5])[0]
+                nc = buf[5]
 
-                if n_channels != CHANNELS or n_samples != CHUNK_SIZE:
+                if nc != CHANNELS or ns != CHUNK_SIZE:
                     stats['errors'] += 1
                     buf = buf[3:]
                     continue
 
-                needed = 6 + n_samples * n_channels * 2
+                needed = 6 + ns * nc * 2
                 if len(buf) < needed:
                     break
 
-                audio_bytes = bytes(buf[6:needed])
+                raw = bytes(buf[6:needed])
                 buf = buf[needed:]
 
-                audio_int = np.frombuffer(audio_bytes, dtype=np.int16)
-                audio_data = audio_int.reshape(n_samples, n_channels).astype(np.float32) / 32768.0
+                samples = np.frombuffer(raw, dtype=np.int16).reshape(ns, nc)
+                audio = samples.astype(np.float32) / 32768.0
 
-                if audio_queue.full():
+                if input_q.full():
                     try:
-                        audio_queue.get_nowait()
+                        input_q.get_nowait()
                         stats['drops'] += 1
                     except queue.Empty:
                         pass
 
-                audio_queue.put(audio_data)
+                input_q.put(audio)
                 stats['packets'] += 1
 
         except Exception as e:
-            print(f"\n[SERIAL] Error: {e}, recovering...")
+            print(f"\n[SER] {e}")
             stats['errors'] += 1
             buf.clear()
-            time.sleep(0.5)
+            time.sleep(0.3)
+
+
+# ============================================================================
+# PROCESSOR THREAD (beamforming)
+# ============================================================================
+
+def processor_thread(input_q, output_q, beamformer, agc):
+    global running, stats
+
+    prev_chunk = np.zeros((CHUNK_SIZE, CHANNELS), dtype=np.float32)
+    cal_chunks = 0
+    cal_target = int(NOISE_CAL_SECONDS * SAMPLE_RATE / CHUNK_SIZE)
+
+    stats['phase'] = 'calibrating'
+    print(f"\n  Noise calibration: stay QUIET for {NOISE_CAL_SECONDS}s...")
+
+    while running:
+        try:
+            chunk = input_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if not beamformer.calibrated:
+            beamformer.feed_noise(chunk)
+            cal_chunks += 1
+            if cal_chunks % 10 == 0:
+                pct = min(100, int(100 * cal_chunks / cal_target))
+                print(f"\r  Calibrating... {pct}%", end='', flush=True)
+            if cal_chunks >= cal_target:
+                beamformer.finish_calibration()
+                stats['phase'] = 'beamforming'
+                print("  Beamforming active!\n")
+            prev_chunk = chunk.copy()
+            continue
+
+        output = beamformer.process(prev_chunk, chunk, AZIMUTH, ELEVATION)
+        output = agc.apply(output)
+        output = np.clip(output, -1.0, 1.0)
+        out_int16 = (output * 32767).astype(np.int16)
+
+        if output_q.full():
             try:
-                ser.reset_input_buffer()
-            except Exception:
+                output_q.get_nowait()
+                stats['drops'] += 1
+            except queue.Empty:
                 pass
 
+        output_q.put(out_int16.tobytes())
+        prev_chunk = chunk.copy()
+
 
 # ============================================================================
-# AUDIO PROCESSING + PLAYBACK THREAD
+# AUDIO WRITER THREAD
 # ============================================================================
 
-def audio_playback_thread(audio_queue, beamformer, agc, p_audio_stream):
-    """Takes chunks from queue, beamforms, applies AGC, writes to speaker."""
-    global running, current_azimuth, current_elevation
-
+def audio_writer_thread(output_q, stream):
+    global running
     silence = np.zeros(CHUNK_SIZE, dtype=np.int16).tobytes()
 
     while running:
         try:
-            audio_data = audio_queue.get(timeout=0.05)
+            data = output_q.get(timeout=0.05)
+            stream.write(data)
         except queue.Empty:
-            p_audio_stream.write(silence)
-            continue
-
-        try:
-            output = beamformer.process(audio_data, current_azimuth, current_elevation)
-            output = agc.apply(output)
-            output = np.clip(output, -1.0, 1.0)
-            output_int16 = (output * 32767).astype(np.int16)
-            p_audio_stream.write(output_int16.tobytes())
-        except Exception as e:
-            print(f"\nProcessing error: {e}")
-            p_audio_stream.write(silence)
+            stream.write(silence)
 
 
 # ============================================================================
-# STATS
+# STATS THREAD
 # ============================================================================
 
-def stats_thread_fn():
+def stats_thread():
     global running, stats
-    last_packets = 0
-
+    last = 0
     while running:
         time.sleep(2.0)
-        pkts = stats['packets']
-        pps = (pkts - last_packets) / 2.0
-        print(f"\r[STATS] pkts={pkts}  rate={pps:.1f}/s  "
-              f"err={stats['errors']}  drop={stats['drops']}  "
-              f"az={current_azimuth:.0f}°",
+        p = stats['packets']
+        pps = (p - last) / 2.0
+        print(f"\r[{stats['phase']}] pkts={p}  {pps:.1f}/s  "
+              f"err={stats['errors']}  drop={stats['drops']}",
               end='', flush=True)
-        last_packets = pkts
+        last = p
 
 
 # ============================================================================
@@ -467,22 +533,22 @@ def main():
     global running
 
     print("=" * 60)
-    print(" Beamforming — Sipeed 6+1 Array + Tang Nano 9K")
+    print(" MVDR Beamforming — Sipeed 6+1 Array + Tang Nano 9K")
     print("=" * 60)
-    print(f"  Port:       {SERIAL_PORT} @ {SERIAL_BAUD/1e6:.0f} Mbaud")
+    print(f"  Port:        {SERIAL_PORT} @ {SERIAL_BAUD/1e6:.0f} Mbaud")
     print(f"  Sample rate: {SAMPLE_RATE} Hz")
     print(f"  Channels:    {CHANNELS}")
-    print(f"  Beamformer:  {BEAMFORMER_TYPE}")
-    print(f"  Direction:   az={AZIMUTH_FRONT}° el={ELEVATION_FRONT}°")
+    print(f"  MVDR band:   {FREQ_MIN}-{FREQ_MAX} Hz")
+    print(f"  OLA FFT:     {OLA_NFFT} pts, hop {OLA_HOP} (50% overlap)")
+    print(f"  Noise cal:   {NOISE_CAL_SECONDS}s")
     print(f"  Array gain:  ~{10*np.log10(CHANNELS):.1f} dB")
 
-    beamformer = FastMVDRBeamformer(MIC_POSITIONS, SAMPLE_RATE, CHUNK_SIZE)
+    beamformer = MVDRBeamformer(MIC_POSITIONS, SAMPLE_RATE)
     agc = SmoothAGC()
-    print(f"MVDR beamformer ready ({beamformer.n_band} active bins, "
-          f"{FREQ_MIN}-{FREQ_MAX} Hz)")
+    print(f"  Active bins: {beamformer.n_band} ({FREQ_MIN}-{FREQ_MAX} Hz)")
 
     p = pyaudio.PyAudio()
-    print("\nAudio output devices:")
+    print("\nAudio outputs:")
     for i in range(p.get_device_count()):
         info = p.get_device_info_by_index(i)
         if info['maxOutputChannels'] > 0:
@@ -495,33 +561,32 @@ def main():
         output=True,
         frames_per_buffer=CHUNK_SIZE * 2
     )
-    print(f"Audio output: {SAMPLE_RATE} Hz mono")
 
-    print(f"\nConnecting to {SERIAL_PORT}...")
+    print(f"\nOpening {SERIAL_PORT}...")
     try:
-        ser = RawSerialPort(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        time.sleep(0.5)
+        ser = RawSerialPort(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
+        time.sleep(0.3)
         ser.reset_input_buffer()
         print(f"Connected ({'pyserial' if ser._ser else 'raw I/O'})")
     except Exception as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    audio_q = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
+    in_q = queue.Queue(maxsize=INPUT_QUEUE_SIZE)
+    out_q = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
 
-    t_serial = threading.Thread(target=serial_reader_thread,
-                                args=(ser, audio_q), daemon=True)
-    t_playback = threading.Thread(target=audio_playback_thread,
-                                  args=(audio_q, beamformer, agc, stream), daemon=True)
-    t_stats = threading.Thread(target=stats_thread_fn, daemon=True)
-
-    t_serial.start()
-    t_playback.start()
-    t_stats.start()
+    threads = [
+        threading.Thread(target=serial_reader_thread, args=(ser, in_q), daemon=True),
+        threading.Thread(target=processor_thread, args=(in_q, out_q, beamformer, agc), daemon=True),
+        threading.Thread(target=audio_writer_thread, args=(out_q, stream), daemon=True),
+        threading.Thread(target=stats_thread, daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     print("\n" + "=" * 60)
     print(" RUNNING — press Ctrl+C to stop")
-    print("=" * 60 + "\n")
+    print("=" * 60)
 
     try:
         while True:
