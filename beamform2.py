@@ -465,10 +465,10 @@ def _match_length(signal, target_len):
     return signal[:target_len]
 
 
-def _normalize(signal, ceiling=0.85):
+def _normalize(signal, target=0.85):
     peak = np.max(np.abs(signal))
-    if peak > ceiling:
-        signal = signal * ceiling / peak
+    if peak > 1e-6:
+        signal = signal * target / peak
     return signal
 
 
